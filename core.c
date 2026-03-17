@@ -12,15 +12,55 @@
 #define debug(...)
 #endif
 
-#define CSR_MSTATUS 0x300
-#define CSR_MTVEC   0x305
-#define CSR_MEPC    0x341
-#define CSR_MCAUSE  0x342
+#define CSR_MSTATUS 0x300  // Machine Status Register
+#define CSR_MIE     0x304  // Machine Interrupt Enable
+#define CSR_MTVEC   0x305  // Machine Trap-Vector Base-Address Register
+#define CSR_MEPC    0x341  // Machine Exception Program Counter
+#define CSR_MCAUSE  0x342  // Machine Cause Register
+#define CSR_MIP     0x344  // Machine Interrupt Pending
 
 uint32_t pc;       // Program counter
 uint32_t xreg[32]; // Register file
 uint8_t mem[1 << 18]; // Memory (256KB)
 uint32_t csr[4096]; // CSR storage (indexed by 12-bit CSR address)
+
+// Check and handle pending interrupts
+void check_interrupts() {
+    uint32_t mstatus = csr[CSR_MSTATUS];
+    uint32_t mie = csr[CSR_MIE];
+    uint32_t mip = csr[CSR_MIP];
+
+    // Check Machine External Interrupt (Bit 11)
+    // Interrupt occurs if: Global MIE is 1, MEIE is 1, and MEIP is 1
+    if ((mstatus & (1 << 3)) && (mie & (1 << 11)) && (mip & (1 << 11))) {
+        debug("--- Taking External Interrupt ---\n");
+
+        // 1. Save current PC to MEPC
+        csr[CSR_MEPC] = pc;
+
+        // 2. Set MCAUSE (Interrupt bit [31] = 1, Exception Code = 11 for Machine External)
+        csr[CSR_MCAUSE] = (1U << 31) | 11;
+
+        // 3. Update MSTATUS: Save MIE to MPIE, then disable MIE
+        uint32_t current_mie = (mstatus >> 3) & 1;
+        mstatus = (mstatus & ~(1 << 7)) | (current_mie << 7); // MPIE = MIE
+        mstatus = mstatus & ~(1 << 3);                        // MIE = 0
+        csr[CSR_MSTATUS] = mstatus;
+
+        // 4. Update PC to MTVEC
+        uint32_t mtvec = csr[CSR_MTVEC];
+        if ((mtvec & 3) == 1) {
+            // Vectored mode: Base + 4 * Exception Code
+            pc = (mtvec & ~3) + 4 * 11;
+        } else {
+            // Direct mode: Base
+            pc = mtvec & ~3;
+        }
+
+        // 5. Clear pending bit (In real hardware, PLIC handles this)
+        csr[CSR_MIP] &= ~(1 << 11);
+    }
+}
 
 int decode_rv32i_instr(uint32_t instr) {
     uint32_t opcode = instr & 0x7F;
@@ -356,13 +396,21 @@ int decode_rv32i_instr(uint32_t instr) {
             if (funct3 == 0) {
                 // Privileged instructions (funct7 depends on instruction)
                 if (instr == 0x00000073) { // ECALL
-                    debug("ecall : handling trap\n");
+                    debug("ecall : handling trap, xreg[3] = 0x%d\n", xreg[3]);
                     csr[CSR_MEPC] = pc; // Save current PC
                     exit(xreg[3]); 
                     return 1;
                 } else if (instr == 0x30200073) { // MRET
                     debug("mret : returning to 0x%x\n", csr[CSR_MEPC]);
                     pc = csr[CSR_MEPC];
+                    
+                    // Restore MIE from MPIE
+                    uint32_t mstatus = csr[CSR_MSTATUS];
+                    uint32_t mpie = (mstatus >> 7) & 1;
+                    mstatus = (mstatus & ~(1 << 3)) | (mpie << 3); // MIE = MPIE
+                    mstatus = mstatus | (1 << 7);                  // MPIE = 1 (Set to 1 after mret)
+                    csr[CSR_MSTATUS] = mstatus;
+                    
                     return 1;
                 }
             } else {
@@ -459,11 +507,21 @@ int main(int argc, char **argv) {
     int cycle_count = 0;
 
     while (cycle_count < max_cycle) {
+
+        // Pseudo external interrupt trigger for simulation purposes
+        if (cycle_count == 40) {
+            csr[CSR_MIP] |= (1 << 11); // Set MEIP (Machine External Interrupt Pending) bit
+            debug("--- External Interrupt Triggered at cycle %d ---\n", cycle_count);
+        }
+
+        // Check for interrupts before fetching the instruction
+        check_interrupts();
+
         uint32_t instr = 0;
         for (int j = 0; j < 4; j++) {
             instr |= ((uint32_t)mem[pc + j] << (j * 8)) & (0xFF << (j * 8));
         }
-        printf("%08x : %08x : ", pc, instr);
+        debug("%08x : %08x : ", pc, instr);
 
         int instr_valid = decode_rv32i_instr(instr);
 
@@ -471,7 +529,7 @@ int main(int argc, char **argv) {
             debug("unknown : instr = 0x%08x\n", instr);
             pc = pc + 4;
         }
-        printf("--------------------\n");
+        debug("--------------------\n");
         cycle_count++;
     }
 
