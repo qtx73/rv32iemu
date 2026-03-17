@@ -10,7 +10,7 @@ for test_file in $test_files; do
     #riscv64-unknown-elf-objcopy -O binary program.elf program.bin
     #hexdump -v -e '"%08x\n"' program.bin > program.hex
     cp "$test_file" program.hex
-    ./a.out program.hex
+    ./core program.hex
     result=$(echo $?)
     expected=1
 

@@ -12,9 +12,15 @@
 #define debug(...)
 #endif
 
+#define CSR_MSTATUS 0x300
+#define CSR_MTVEC   0x305
+#define CSR_MEPC    0x341
+#define CSR_MCAUSE  0x342
+
 uint32_t pc;       // Program counter
 uint32_t xreg[32]; // Register file
 uint8_t mem[1 << 18]; // Memory (256KB)
+uint32_t csr[4096]; // CSR storage (indexed by 12-bit CSR address)
 
 int decode_rv32i_instr(uint32_t instr) {
     uint32_t opcode = instr & 0x7F;
@@ -344,13 +350,63 @@ int decode_rv32i_instr(uint32_t instr) {
                     return 1;
                 default : return 0;
             }
-        case 0x73 : // ECALL
-            if (instr == 0x00000073) {
-                debug("ecall : exit(0x%x)\n", xreg[3]);
-                exit(xreg[3]);
+        case 0x73 : { // SYSTEM instructions (CSR and Privileged)
+            uint16_t csr_addr = instr >> 20; // Extract 12-bit CSR address
+            
+            if (funct3 == 0) {
+                // Privileged instructions (funct7 depends on instruction)
+                if (instr == 0x00000073) { // ECALL
+                    debug("ecall : handling trap\n");
+                    csr[CSR_MEPC] = pc; // Save current PC
+                    exit(xreg[3]); 
+                    return 1;
+                } else if (instr == 0x30200073) { // MRET
+                    debug("mret : returning to 0x%x\n", csr[CSR_MEPC]);
+                    pc = csr[CSR_MEPC];
+                    return 1;
+                }
             } else {
-                return 0;
+                // CSR Access instructions
+                uint32_t old_val = csr[csr_addr];
+                uint32_t new_val;
+
+                switch (funct3) {
+                    case 0x1: // CSRRW (Read/Write)
+                        new_val = xreg[rs1];
+                        if (rd != 0) xreg[rd] = old_val;
+                        csr[csr_addr] = new_val;
+                        debug("csrrw : xreg[0x%x] = old(0x%x), csr[0x%x] = 0x%x\n", rd, old_val, csr_addr, new_val);
+                        break;
+                        
+                    case 0x2: // CSRRS (Read and Set bits)
+                        new_val = old_val | xreg[rs1];
+                        if (rd != 0) xreg[rd] = old_val;
+                        csr[csr_addr] = new_val;
+                        debug("csrrs : xreg[0x%x] = old(0x%x), csr[0x%x] = 0x%x\n", rd, old_val, csr_addr, new_val);
+                        break;
+
+                    case 0x3: // CSRRC (Read and Clear bits)
+                        new_val = old_val & ~xreg[rs1];
+                        if (rd != 0) xreg[rd] = old_val;
+                        csr[csr_addr] = new_val;
+                        debug("csrrc : xreg[0x%x] = old(0x%x), csr[0x%x] = 0x%x\n", rd, old_val, csr_addr, new_val);
+                        break;
+
+                    case 0x5: // CSRRWI (Immediate Read/Write)
+                        new_val = rs1; // rs1 field is used as 5-bit zero-extended immediate
+                        if (rd != 0) xreg[rd] = old_val;
+                        csr[csr_addr] = new_val;
+                        debug("csrrwi : xreg[0x%x] = old(0x%x), csr[0x%x] = 0x%x\n", rd, old_val, csr_addr, new_val);
+                        break;
+
+                    default:
+                        return 0;
+                }
+                pc += 4;
+                return 1;
             }
+            return 0;
+        }
         default : return 0;
     }
     return 0;
